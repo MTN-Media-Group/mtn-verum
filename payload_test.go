@@ -10,8 +10,7 @@ import (
 )
 
 func TestCanonicalEncodingNoAmbiguity(t *testing.T) {
-	// Two payloads that would collide if fields were concatenated without
-	// length prefixes. The canonical encoding must distinguish them.
+	// Without length prefixes these two payloads would collide.
 	at := time.Unix(1700000000, 0)
 	a := Payload{GeneratedAt: at, Provider: "ab", Model: "cd"}
 	b := Payload{GeneratedAt: at, Provider: "abcd", Model: ""}

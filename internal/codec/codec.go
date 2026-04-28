@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 MTN Media Group.
 
-// Package codec wraps decode and encode for the formats verum supports.
-// It exists so the rest of the package never imports image/jpeg etc. directly,
-// keeping format-specific concerns (quality settings, lossless flags) here.
+// Package codec wraps PNG, JPEG, and lossless WebP I/O.
 package codec
 
 import (
@@ -12,7 +10,6 @@ import (
 	"image"
 	"image/jpeg"
 	"image/png"
-	"io"
 
 	nativewebp "github.com/HugoSmits86/nativewebp"
 	xwebp "golang.org/x/image/webp"
@@ -27,12 +24,8 @@ const (
 	FormatUnknown Format = ""
 )
 
-// ErrUnsupported is returned when a format cannot be decoded or encoded.
-// Callers translate this to verum.ErrUnsupportedFormat at the API boundary.
 var ErrUnsupported = errors.New("codec: unsupported format")
 
-// Sniff identifies the input image format. It looks at the first bytes only —
-// no full decode. Returns FormatUnknown if no signature matches.
 func Sniff(data []byte) Format {
 	switch {
 	case len(data) >= 8 && bytes.Equal(data[:8], []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}):
@@ -45,9 +38,7 @@ func Sniff(data []byte) Format {
 	return FormatUnknown
 }
 
-// Decode returns the decoded image and the detected format. The format is
-// derived from the bytes, not from any caller-supplied MIME type, so callers
-// can't trick the decoder into the wrong codec.
+// Decode picks the decoder from the bytes, not a caller-supplied MIME type.
 func Decode(data []byte) (image.Image, Format, error) {
 	f := Sniff(data)
 	r := bytes.NewReader(data)
@@ -65,40 +56,38 @@ func Decode(data []byte) (image.Image, Format, error) {
 	return nil, FormatUnknown, ErrUnsupported
 }
 
-// EncodeOptions controls per-format encoding choices. Only fields relevant
-// to the selected format are honoured.
 type EncodeOptions struct {
 	JPEGQuality int  // 1..100; 0 means default (85)
-	PNGFastest  bool // png.BestSpeed instead of DefaultCompression
+	PNGFastest  bool
 }
 
-// Encode writes the image in the requested format. WebP encoding is always
-// lossless in v1 (nativewebp is pure-Go and lossless-only); a lossy WebP path
-// would require a CGO build, which is intentionally avoided.
+// Encode writes img. WebP output is always lossless (no CGO).
 func Encode(img image.Image, format Format, opt EncodeOptions) ([]byte, error) {
 	var buf bytes.Buffer
-	if err := encodeTo(&buf, img, format, opt); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-func encodeTo(w io.Writer, img image.Image, format Format, opt EncodeOptions) error {
 	switch format {
 	case FormatPNG:
-		enc := png.Encoder{CompressionLevel: png.DefaultCompression}
+		level := png.DefaultCompression
 		if opt.PNGFastest {
-			enc.CompressionLevel = png.BestSpeed
+			level = png.BestSpeed
 		}
-		return enc.Encode(w, img)
+		enc := png.Encoder{CompressionLevel: level}
+		if err := enc.Encode(&buf, img); err != nil {
+			return nil, err
+		}
 	case FormatJPEG:
 		q := opt.JPEGQuality
 		if q == 0 {
 			q = 85
 		}
-		return jpeg.Encode(w, img, &jpeg.Options{Quality: q})
+		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: q}); err != nil {
+			return nil, err
+		}
 	case FormatWebP:
-		return nativewebp.Encode(w, img, nil)
+		if err := nativewebp.Encode(&buf, img, nil); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, ErrUnsupported
 	}
-	return ErrUnsupported
+	return buf.Bytes(), nil
 }

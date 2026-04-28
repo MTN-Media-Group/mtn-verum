@@ -6,15 +6,12 @@ package verum
 import "fmt"
 
 const (
-	MinImageDim    = 256
-	DefaultTileSize = 64
-	LargeTileSize   = 96
+	MinImageDim         = 256
+	DefaultTileSize     = 64
+	LargeTileSize       = 96
 	largeImageThreshold = 2048
 )
 
-// Key is one HMAC secret plus a stable identifier. Embedders use ActiveKey;
-// detectors try every key in DetectionKeys (which should include the active
-// one) so callers can rotate without breaking historic images.
 type Key struct {
 	ID     string
 	Secret []byte
@@ -35,17 +32,16 @@ const (
 	MetadataStandard MetadataMode = "standard"
 )
 
-// QualityConfig holds the gates the embedder enforces after writing pixels.
-// Zero values fall back to per-profile defaults; explicit values override.
+// QualityConfig zero values fall back to per-profile defaults.
 type QualityConfig struct {
 	MinSSIM        float64
 	MinPSNR        float64
+	MaxDelta       float64
 	MaxChangeRatio float64
 	MaxRetries     int
 }
 
-// DetectionConfig limits the search space for Detect. Zero values pick safe
-// defaults: native + 0.75x + 0.5x sweep, every configured key.
+// DetectionConfig.Scales is currently ignored (v1 detects at native scale only); values must be in (0, 2] when set.
 type DetectionConfig struct {
 	Scales   []float64
 	MinTiles int
@@ -77,12 +73,14 @@ func (c *Config) validate(forEmbed bool) error {
 	default:
 		return fmt.Errorf("%w: unknown strength %q", ErrInvalidConfig, c.Strength)
 	}
+	for _, scale := range c.Detection.Scales {
+		if scale <= 0 || scale > 2 {
+			return fmt.Errorf("%w: detection scale must be > 0 and <= 2", ErrInvalidConfig)
+		}
+	}
 	return nil
 }
 
-// detectionKeys returns DetectionKeys augmented with ActiveKey when the
-// active key is set and not already present. Detection always tries the
-// active key.
 func (c *Config) detectionKeys() []Key {
 	if c.ActiveKey.ID == "" {
 		return c.DetectionKeys
@@ -98,7 +96,6 @@ func (c *Config) detectionKeys() []Key {
 	return out
 }
 
-// strengthProfile resolves the configured profile, falling back to invisible.
 func (c *Config) strengthProfile() StrengthProfile {
 	if c.Strength == "" {
 		return StrengthInvisible
@@ -106,55 +103,36 @@ func (c *Config) strengthProfile() StrengthProfile {
 	return c.Strength
 }
 
-// strengthDelta is the coefficient-pair bias the embedder applies. Larger
-// values mean stronger detection at the cost of higher visual risk.
+type profileDefaults struct {
+	delta, minSSIM, minPSNR, maxDelta float64
+}
+
+var profileTable = map[StrengthProfile]profileDefaults{
+	StrengthInvisible: {delta: 4, minSSIM: 0.999, minPSNR: 50, maxDelta: 12},
+	StrengthBalanced:  {delta: 6, minSSIM: 0.997, minPSNR: 46, maxDelta: 18},
+	StrengthRobust:    {delta: 9, minSSIM: 0.993, minPSNR: 42, maxDelta: 24},
+}
+
 func strengthDelta(p StrengthProfile) float64 {
-	switch p {
-	case StrengthBalanced:
-		return 6.0
-	case StrengthRobust:
-		return 9.0
-	}
-	return 4.0
+	return profileTable[p].delta
 }
 
-// qualityGates returns effective gates for the profile, honouring overrides.
 func qualityGates(p StrengthProfile, q QualityConfig) QualityConfig {
-	out := q
-	if out.MinSSIM == 0 {
-		switch p {
-		case StrengthBalanced:
-			out.MinSSIM = 0.997
-		case StrengthRobust:
-			out.MinSSIM = 0.993
-		default:
-			out.MinSSIM = 0.999
-		}
+	d := profileTable[p]
+	if q.MinSSIM == 0 {
+		q.MinSSIM = d.minSSIM
 	}
-	if out.MinPSNR == 0 {
-		switch p {
-		case StrengthBalanced:
-			out.MinPSNR = 46
-		case StrengthRobust:
-			out.MinPSNR = 42
-		default:
-			out.MinPSNR = 50
-		}
+	if q.MinPSNR == 0 {
+		q.MinPSNR = d.minPSNR
 	}
-	if out.MaxChangeRatio == 0 {
-		out.MaxChangeRatio = 0.6
+	if q.MaxDelta == 0 {
+		q.MaxDelta = d.maxDelta
 	}
-	if out.MaxRetries == 0 {
-		out.MaxRetries = 2
+	if q.MaxChangeRatio == 0 {
+		q.MaxChangeRatio = 0.6
 	}
-	return out
-}
-
-// detectionScales returns the candidate downscale factors for Detect. The
-// detector also always tries 1.0 (native).
-func (c *Config) detectionScales() []float64 {
-	if len(c.Detection.Scales) > 0 {
-		return c.Detection.Scales
+	if q.MaxRetries == 0 {
+		q.MaxRetries = 2
 	}
-	return []float64{1.0, 0.75, 0.5}
+	return q
 }

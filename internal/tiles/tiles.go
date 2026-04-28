@@ -1,114 +1,81 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 MTN Media Group.
 
-// Package tiles partitions a luminance plane into deterministic blocks and
-// scores how much hidden modulation each one can absorb without a visible
-// artefact. The score combines local texture, edge energy, and alpha so the
-// embedder can avoid skin, flat gradients, and transparent regions.
+// Package tiles partitions a luminance plane into a deterministic grid and scores per-tile capacity.
 package tiles
 
-import "sort"
+import (
+	"math"
+	"sort"
+)
 
-// Plane is a planar single-channel image. Alpha is optional; when nil all
-// pixels are treated as fully opaque. Pixels are stored row-major.
+// Plane is row-major; Alpha=nil means fully opaque.
 type Plane struct {
 	W, H   int
 	Pixels []float64
 	Alpha  []float64
 }
 
-// Tile is one rectangular region of the plane plus its capacity score.
 type Tile struct {
-	Index   int
-	X, Y    int
-	Size    int
-	Score   float64 // higher is more capacity; <=0 means skip
-	Texture float64
-	Edges   float64
-	Alpha   float64
+	Index int
+	X, Y  int
+	Size  int
+	Score float64 // <=0 means skip
 }
 
-// Iterate produces a deterministic grid of size×size tiles starting at the
-// top-left. Incomplete trailing rows/columns are dropped because they cannot
-// hold a full set of 8×8 sub-blocks.
+// Iterate drops incomplete trailing tiles so every returned tile holds a full set of 8x8 sub-blocks.
 func Iterate(p *Plane, size int) []Tile {
-	cols := p.W / size
-	rows := p.H / size
+	cols, rows := p.W/size, p.H/size
 	out := make([]Tile, 0, rows*cols)
-	idx := 0
 	for ty := 0; ty < rows; ty++ {
 		for tx := 0; tx < cols; tx++ {
 			t := Tile{
-				Index: idx,
+				Index: len(out),
 				X:     tx * size,
 				Y:     ty * size,
 				Size:  size,
 			}
-			scoreTile(p, &t)
+			t.Score = score(p, t.X, t.Y, size)
 			out = append(out, t)
-			idx++
 		}
 	}
 	return out
 }
 
-func scoreTile(p *Plane, t *Tile) {
-	var sum, sumSq float64
-	var edges float64
-	var alphaSum float64
-	n := float64(t.Size * t.Size)
-	for y := t.Y; y < t.Y+t.Size; y++ {
+// score returns 0 for a skip tile, otherwise positive capacity. Thresholds are tuned for 8-bit luminance.
+func score(p *Plane, x0, y0, size int) float64 {
+	var sum, sumSq, edges, alphaSum float64
+	n := float64(size * size)
+	for y := y0; y < y0+size; y++ {
 		row := y * p.W
-		for x := t.X; x < t.X+t.Size; x++ {
+		for x := x0; x < x0+size; x++ {
 			v := p.Pixels[row+x]
 			sum += v
 			sumSq += v * v
 			if p.Alpha != nil {
 				alphaSum += p.Alpha[row+x]
 			}
-			if x+1 < t.X+t.Size {
-				dx := p.Pixels[row+x+1] - v
-				if dx < 0 {
-					dx = -dx
-				}
-				edges += dx
+			if x+1 < x0+size {
+				edges += math.Abs(p.Pixels[row+x+1] - v)
 			}
-			if y+1 < t.Y+t.Size {
-				dy := p.Pixels[(y+1)*p.W+x] - v
-				if dy < 0 {
-					dy = -dy
-				}
-				edges += dy
+			if y+1 < y0+size {
+				edges += math.Abs(p.Pixels[(y+1)*p.W+x] - v)
 			}
 		}
 	}
 	mean := sum / n
 	variance := sumSq/n - mean*mean
-	if variance < 0 {
-		variance = 0
-	}
 	edges /= n
 	alpha := 1.0
 	if p.Alpha != nil {
 		alpha = alphaSum / n
 	}
-
-	t.Texture = variance
-	t.Edges = edges
-	t.Alpha = alpha
-
-	// Discard near-flat or mostly-transparent tiles outright. The thresholds
-	// are tuned for 8-bit luminance scaled to [-128, 127]; well below typical
-	// JPEG noise floors.
 	if alpha < 0.95 || variance < 8 || edges < 1.5 {
-		t.Score = 0
-		return
+		return 0
 	}
-	t.Score = variance*0.6 + edges*8.0
+	return variance*0.6 + edges*8.0
 }
 
-// SelectByScore returns the indices of the highest-scoring tiles, capped to
-// max. Tiles with non-positive scores are excluded.
 func SelectByScore(ts []Tile, max int) []int {
 	idx := make([]int, 0, len(ts))
 	for i, t := range ts {

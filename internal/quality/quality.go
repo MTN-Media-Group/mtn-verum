@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 MTN Media Group.
 
-// Package quality computes per-image distortion metrics. PSNR is cheap and
-// global. SSIM is windowed and tracks structural change, so the embedder can
-// reject embeds that look fine in PSNR but pattern visibly.
+// Package quality computes per-image distortion metrics.
 package quality
 
 import (
 	"math"
 )
 
-// PSNR returns peak signal-to-noise ratio in decibels between two single-
-// channel planes scaled into [0, 255]. Identical inputs return +Inf.
+// PSNR is in dB; identical inputs return +Inf.
 func PSNR(a, b []float64) float64 {
 	if len(a) != len(b) || len(a) == 0 {
 		return 0
@@ -28,10 +25,7 @@ func PSNR(a, b []float64) float64 {
 	return 10 * math.Log10(255*255/mse)
 }
 
-// SSIM returns the mean structural similarity index between two planes.
-// Inputs are expected on the same scale (typically [0, 255]). The window is
-// an 8x8 box; this is coarser than the canonical 11x11 Gaussian but fast and
-// adequate for the gating decisions verum makes.
+// SSIM uses an 8x8 box window — coarser than the canonical 11x11 Gaussian, but adequate for embed gating.
 func SSIM(a, b []float64, width, height int) float64 {
 	if len(a) != width*height || len(b) != width*height || width < 8 || height < 8 {
 		return 0
@@ -78,8 +72,7 @@ func SSIM(a, b []float64, width, height int) float64 {
 	return sum / float64(n)
 }
 
-// MaxAbsDelta returns the largest single-pixel difference between two planes.
-// Useful as a guardrail against localised spikes that PSNR averages away.
+// MaxAbsDelta catches localised spikes that PSNR averages away.
 func MaxAbsDelta(a, b []float64) float64 {
 	if len(a) != len(b) {
 		return 0
@@ -97,9 +90,7 @@ func MaxAbsDelta(a, b []float64) float64 {
 	return m
 }
 
-// ChangedPixelRatio returns the fraction of pixels whose absolute delta
-// exceeds threshold. Used to detect distributed-but-thin patterns that
-// individually pass PSNR/SSIM but together create banding.
+// ChangedPixelRatio catches thin distributed patterns that pass PSNR/SSIM but band.
 func ChangedPixelRatio(a, b []float64, threshold float64) float64 {
 	if len(a) != len(b) || len(a) == 0 {
 		return 0

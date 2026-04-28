@@ -8,6 +8,10 @@ such, without relying on metadata that strips during re-encoding or upload.
 
 Status: pre-release. API and on-image format are not yet stable.
 
+Current validation covers native-scale embed/detect on PNG. JPEG output is
+supported by the encoder, but JPEG round-trip detection is not yet a guarantee.
+Crop and resize recovery are not implemented in this version.
+
 ## License
 
 This project is licensed under the **GNU Affero General Public License v3.0

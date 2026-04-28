@@ -8,6 +8,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"image"
 	"image/draw"
@@ -20,9 +21,7 @@ import (
 	"github.com/MTN-Media-Group/mtn-verum/internal/tiles"
 )
 
-// midFreqPositions are the (u, v) DCT coefficient indices the embedder draws
-// pairs from. The set excludes DC and the lowest two diagonals (visible at
-// any strength), and the highest frequencies (quantised away by JPEG).
+// midFreqPositions excludes DC and the lowest two diagonals (visible) and the top frequencies (JPEG-quantised away).
 var midFreqPositions = [...][2]int{
 	{1, 2}, {2, 1}, {1, 3}, {3, 1}, {2, 2},
 	{1, 4}, {4, 1}, {2, 3}, {3, 2},
@@ -30,6 +29,8 @@ var midFreqPositions = [...][2]int{
 	{1, 6}, {6, 1}, {2, 5}, {5, 2}, {3, 4}, {4, 3},
 	{2, 6}, {6, 2}, {3, 5}, {5, 3}, {4, 4},
 }
+
+const transparentAlphaThreshold = 5.0 / 255.0
 
 func embed(ctx context.Context, data []byte, mimeType string, payload Payload, cfg Config) (*EmbedResult, error) {
 	if err := cfg.validate(true); err != nil {
@@ -39,12 +40,12 @@ func embed(ctx context.Context, data []byte, mimeType string, payload Payload, c
 	if err != nil {
 		return nil, err
 	}
-	frame := ecc.Frame(byte(PayloadVersion), keyIDByte(cfg.ActiveKey.ID), digest)
+	frame := ecc.Frame(byte(PayloadVersion), keyIDBytes(cfg.ActiveKey.ID), digest)
 	bits := ecc.BitsOf(frame)
 
 	img, srcFormat, err := codec.Decode(data)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrUnsupportedFormat, err)
+		return nil, fmt.Errorf("%w: %w", ErrUnsupportedFormat, err)
 	}
 	rect := img.Bounds()
 	w, h := rect.Dx(), rect.Dy()
@@ -53,7 +54,7 @@ func embed(ctx context.Context, data []byte, mimeType string, payload Payload, c
 	}
 
 	rgba := toRGBA(img)
-	yPlane, cbPlane, crPlane, _ := splitYCbCrA(rgba)
+	plane, cb, cr := splitYCbCr(rgba)
 
 	tileSize := DefaultTileSize
 	if max(w, h) >= largeImageThreshold {
@@ -61,31 +62,31 @@ func embed(ctx context.Context, data []byte, mimeType string, payload Payload, c
 	}
 
 	profile := cfg.strengthProfile()
+	original := append([]float64(nil), plane.Pixels...)
 	gates := qualityGates(profile, cfg.Quality)
 
-	originalY := append([]float64(nil), yPlane.Pixels...)
-
 	var (
-		report  *embedReport
+		report  QualityReport
+		ratio   float64
 		gateErr error
 	)
 	for attempt := 0; attempt <= gates.MaxRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		copy(yPlane.Pixels, originalY)
-		delta := strengthDelta(profile) * (1.0 - 0.18*float64(attempt))
-		report, gateErr = embedAttempt(yPlane, tileSize, bits, cfg.ActiveKey, delta, gates)
+		copy(plane.Pixels, original)
+		report, ratio, gateErr = embedAttempt(plane, original, tileSize, bits, cfg.ActiveKey, profile, gates)
 		if gateErr == nil {
 			break
 		}
 		profile = downgradeProfile(profile)
+		gates = qualityGates(profile, cfg.Quality)
 	}
 	if gateErr != nil {
 		return nil, gateErr
 	}
 
-	mergeYCbCr(rgba, yPlane, cbPlane, crPlane)
+	mergeYCbCr(rgba, plane, cb, cr)
 
 	outFormat := codec.Format(mimeType)
 	if outFormat == "" {
@@ -93,11 +94,9 @@ func embed(ctx context.Context, data []byte, mimeType string, payload Payload, c
 	}
 	encoded, err := codec.Encode(rgba, outFormat, codec.EncodeOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrUnsupportedFormat, err)
+		return nil, fmt.Errorf("%w: %w", ErrUnsupportedFormat, err)
 	}
 
-	// Self-detection runs against the encoded bytes so we catch losses
-	// introduced by JPEG quantisation, not only the in-memory plane.
 	self, err := selfDetect(encoded, tileSize, cfg)
 	if err != nil || !self.Detected {
 		return nil, ErrSelfDetectionFailed
@@ -106,12 +105,12 @@ func embed(ctx context.Context, data []byte, mimeType string, payload Payload, c
 	res := &EmbedResult{
 		Data:              encoded,
 		MimeType:          string(outFormat),
-		PayloadDigest:     hexDigest(digest),
+		PayloadDigest:     hex.EncodeToString(digest),
 		KeyID:             cfg.ActiveKey.ID,
 		Version:           PayloadVersion,
 		SelfDetection:     *self,
-		Quality:           report.toReport(),
-		ChangedPixelRatio: report.changeRatio,
+		Quality:           report,
+		ChangedPixelRatio: ratio,
 	}
 	if cfg.MetadataMode == MetadataStandard {
 		res.Metadata = map[string]string{
@@ -123,94 +122,70 @@ func embed(ctx context.Context, data []byte, mimeType string, payload Payload, c
 	return res, nil
 }
 
-type embedReport struct {
-	ssim, psnr, maxDelta, changeRatio float64
-	usedTiles                         int
-}
-
-func (r *embedReport) toReport() QualityReport {
-	return QualityReport{
-		SSIM:     r.ssim,
-		PSNR:     r.psnr,
-		MaxDelta: r.maxDelta,
-		Tiles:    r.usedTiles,
-	}
-}
-
-func embedAttempt(y *tiles.Plane, tileSize int, bits []uint8, key Key, delta float64, gates QualityConfig) (*embedReport, error) {
+func embedAttempt(y *tiles.Plane, original []float64, tileSize int, bits []uint8, key Key, profile StrengthProfile, gates QualityConfig) (QualityReport, float64, error) {
 	all := tiles.Iterate(y, tileSize)
-	pairsPerBlock := pairsPerSubBlock(len(bits))
+	pairsPerBlock := pairsPerSubBlock(tileSize, len(bits))
 	bitsPerTile := pairsPerBlock * subBlocksPerTile(tileSize)
-
-	oneCopy := minTilesNeeded(len(bits), bitsPerTile)
-	idxs := tiles.SelectByScore(all, len(all))
-	if len(idxs) < oneCopy {
-		return nil, ErrNoCapacity
+	idxs := selectTiles(all, len(bits), bitsPerTile)
+	if len(idxs) == 0 {
+		return QualityReport{}, 0, ErrNoCapacity
 	}
-	idxs = idxs[:oneCopy*minRepetition(len(idxs), oneCopy)]
 
-	original := append([]float64(nil), y.Pixels...)
+	delta := strengthDelta(profile)
 	for _, i := range idxs {
-		applyTile(y.Pixels, y.W, &all[i], bits, pairsPerBlock, key, delta)
+		applyTile(y, &all[i], bits, pairsPerBlock, key, delta)
 	}
 
-	rep := &embedReport{usedTiles: len(idxs)}
-	rep.ssim = quality.SSIM(original, y.Pixels, y.W, y.H)
-	rep.psnr = quality.PSNR(original, y.Pixels)
-	rep.maxDelta = quality.MaxAbsDelta(original, y.Pixels)
-	rep.changeRatio = quality.ChangedPixelRatio(original, y.Pixels, 0.5)
-
-	if rep.ssim < gates.MinSSIM || rep.psnr < gates.MinPSNR || rep.changeRatio > gates.MaxChangeRatio {
-		return rep, ErrQualityGateFailed
+	report := QualityReport{
+		SSIM:     quality.SSIM(original, y.Pixels, y.W, y.H),
+		PSNR:     quality.PSNR(original, y.Pixels),
+		MaxDelta: quality.MaxAbsDelta(original, y.Pixels),
+		Tiles:    len(idxs),
 	}
-	return rep, nil
+	ratio := quality.ChangedPixelRatio(original, y.Pixels, 0.5)
+
+	if report.SSIM < gates.MinSSIM || report.PSNR < gates.MinPSNR || report.MaxDelta > gates.MaxDelta || ratio > gates.MaxChangeRatio {
+		return report, ratio, ErrQualityGateFailed
+	}
+	return report, ratio, nil
 }
 
-// selfDetect runs the public detection pipeline against freshly-encoded
-// bytes. It uses only the active key and native scale so its cost is closer
-// to a single embed pass than a full multi-key sweep.
 func selfDetect(encoded []byte, tileSize int, cfg Config) (*DetectResult, error) {
 	img, _, err := codec.Decode(encoded)
 	if err != nil {
 		return nil, err
 	}
-	plane := luminancePlane(img)
-	return detectFromY(plane, plane.W, plane.H, tileSize, []Key{cfg.ActiveKey}, []float64{1.0}, cfg.Detection)
+	plane, _, _ := splitYCbCr(toRGBA(img))
+	return detectFromY(plane, tileSize, []Key{cfg.ActiveKey}, cfg.Detection)
 }
 
-func applyTile(pixels []float64, w int, t *tiles.Tile, bits []uint8, pairsPerBlock int, key Key, delta float64) {
-	subRows := t.Size / dct.N
-	subCols := t.Size / dct.N
-	for sr := 0; sr < subRows; sr++ {
-		for sc := 0; sc < subCols; sc++ {
-			subIdx := sr*subCols + sc
-			origin := (t.Y+sr*dct.N)*w + (t.X + sc*dct.N)
+func applyTile(y *tiles.Plane, t *tiles.Tile, bits []uint8, pairsPerBlock int, key Key, delta float64) {
+	subN := t.Size / dct.N
+	for sr := 0; sr < subN; sr++ {
+		for sc := 0; sc < subN; sc++ {
+			subIdx := sr*subN + sc
+			origin := (t.Y+sr*dct.N)*y.W + (t.X + sc*dct.N)
 			var block [dct.N * dct.N]float64
-			loadBlock(pixels, w, origin, &block)
+			loadBlock(y.Pixels, y.W, origin, &block)
 			dct.Forward(&block)
-			pairs := derivePairs(key.Secret, t.Index, subIdx, pairsPerBlock)
-			for j, pr := range pairs {
-				bit := bits[(subIdx*pairsPerBlock+j)%len(bits)]
-				biasPair(&block, pr, bit, delta)
+			for j, pr := range derivePairs(key, t.Index, subIdx, pairsPerBlock) {
+				biasPair(&block, pr, bits[subIdx*pairsPerBlock+j], delta)
 			}
 			dct.Inverse(&block)
-			storeBlock(pixels, w, origin, &block)
+			storeBlock(y.Pixels, y.Alpha, y.W, origin, &block)
 		}
 	}
 }
 
 func biasPair(b *[dct.N * dct.N]float64, p [2][2]int, bit uint8, delta float64) {
-	a := p[0][0]*dct.N + p[0][1]
-	c := p[1][0]*dct.N + p[1][1]
+	a, c := p[0][0]*dct.N+p[0][1], p[1][0]*dct.N+p[1][1]
 	mid := (b[a] + b[c]) * 0.5
 	half := delta * 0.5
-	if bit == 1 {
-		b[a] = mid + half
-		b[c] = mid - half
-	} else {
-		b[a] = mid - half
-		b[c] = mid + half
+	if bit == 0 {
+		half = -half
 	}
+	b[a] = mid + half
+	b[c] = mid - half
 }
 
 func loadBlock(pixels []float64, w, origin int, b *[dct.N * dct.N]float64) {
@@ -222,37 +197,31 @@ func loadBlock(pixels []float64, w, origin int, b *[dct.N * dct.N]float64) {
 	}
 }
 
-func storeBlock(pixels []float64, w, origin int, b *[dct.N * dct.N]float64) {
+func storeBlock(pixels, alpha []float64, w, origin int, b *[dct.N * dct.N]float64) {
 	for r := 0; r < dct.N; r++ {
 		for c := 0; c < dct.N; c++ {
+			idx := origin + r*w + c
+			if alpha != nil && alpha[idx] < transparentAlphaThreshold {
+				continue
+			}
 			v := b[r*dct.N+c] + 128
-			if v < 0 {
+			switch {
+			case v < 0:
 				v = 0
-			} else if v > 255 {
+			case v > 255:
 				v = 255
 			}
-			pixels[origin+r*w+c] = v
+			pixels[idx] = v
 		}
 	}
 }
 
-// derivePairs picks pairsPerBlock disjoint pairs from midFreqPositions,
-// shuffled by an HMAC stream keyed by (secret, tileIndex, subBlockIndex).
-// Pairs are stable per (key, tile, sub-block) so the detector can recompute
-// them without seeing the digest.
-func derivePairs(secret []byte, tileIdx, subIdx, pairsPerBlock int) [][2][2]int {
-	mac := hmac.New(sha256.New, secret)
-	var buf [12]byte
-	binary.BigEndian.PutUint32(buf[0:4], uint32(tileIdx))
-	binary.BigEndian.PutUint32(buf[4:8], uint32(subIdx))
-	binary.BigEndian.PutUint32(buf[8:12], 0)
-	mac.Write(buf[:])
-	seed := mac.Sum(nil)
-
+func derivePairs(key Key, tileIdx, subIdx, pairsPerBlock int) [][2][2]int {
 	pool := make([][2]int, len(midFreqPositions))
 	copy(pool, midFreqPositions[:])
+	rng := newPairRNG(key, tileIdx, subIdx)
 	for i := len(pool) - 1; i > 0; i-- {
-		j := int(seed[i%len(seed)]) % (i + 1)
+		j := rng.intn(i + 1)
 		pool[i], pool[j] = pool[j], pool[i]
 	}
 	out := make([][2][2]int, pairsPerBlock)
@@ -262,19 +231,66 @@ func derivePairs(secret []byte, tileIdx, subIdx, pairsPerBlock int) [][2][2]int 
 	return out
 }
 
-func pairsPerSubBlock(frameBits int) int {
-	const subBlocksWithSlack = 60
-	k := frameBits / subBlocksWithSlack
-	if k*subBlocksWithSlack < frameBits {
-		k++
+// pairRNG expands an HMAC-SHA256 counter-mode stream keyed on (secret, keyID, tileIdx, subIdx).
+type pairRNG struct {
+	key     Key
+	tileIdx int
+	subIdx  int
+	counter uint32
+	buf     []byte
+	pos     int
+}
+
+func newPairRNG(key Key, tileIdx, subIdx int) *pairRNG {
+	r := &pairRNG{key: key, tileIdx: tileIdx, subIdx: subIdx}
+	r.refill()
+	return r
+}
+
+func (r *pairRNG) refill() {
+	mac := hmac.New(sha256.New, r.key.Secret)
+	mac.Write([]byte("verum-pairs-v2"))
+	kid := keyIDBytes(r.key.ID)
+	mac.Write(kid[:])
+	var seed [12]byte
+	binary.BigEndian.PutUint32(seed[0:4], uint32(r.tileIdx))
+	binary.BigEndian.PutUint32(seed[4:8], uint32(r.subIdx))
+	binary.BigEndian.PutUint32(seed[8:12], r.counter)
+	mac.Write(seed[:])
+	r.buf = mac.Sum(r.buf[:0])
+	r.pos = 0
+	r.counter++
+}
+
+func (r *pairRNG) uint32() uint32 {
+	if r.pos+4 > len(r.buf) {
+		r.refill()
 	}
-	if k < 1 {
-		k = 1
+	v := binary.BigEndian.Uint32(r.buf[r.pos:])
+	r.pos += 4
+	return v
+}
+
+// intn returns a uniform integer in [0, n) via rejection sampling.
+func (r *pairRNG) intn(n int) int {
+	limit := (uint64(1) << 32) / uint64(n) * uint64(n)
+	for {
+		if v := uint64(r.uint32()); v < limit {
+			return int(v % uint64(n))
+		}
 	}
-	if k*2 > len(midFreqPositions) {
-		k = len(midFreqPositions) / 2
+}
+
+// pairsPerSubBlock picks k so each tile holds an integer number of frame copies and every bit is voted equally.
+func pairsPerSubBlock(tileSize, frameBits int) int {
+	subBlocks := subBlocksPerTile(tileSize)
+	maxPairs := len(midFreqPositions) / 2
+	for k := 1; k <= maxPairs; k++ {
+		if bits := k * subBlocks; bits >= frameBits && bits%frameBits == 0 {
+			return k
+		}
 	}
-	return k
+	return maxPairs
 }
 
 func subBlocksPerTile(tileSize int) int {
@@ -282,36 +298,20 @@ func subBlocksPerTile(tileSize int) int {
 	return n * n
 }
 
-func minTilesNeeded(frameBits, bitsPerTile int) int {
-	if bitsPerTile <= 0 {
-		return 0
-	}
-	t := frameBits / bitsPerTile
-	if t*bitsPerTile < frameBits {
-		t++
-	}
-	if t < 1 {
-		t = 1
-	}
-	return t
-}
+const maxRepetition = 12
 
-// minRepetition decides how many tile copies of the frame to write given the
-// pool of usable tiles and the minimum needed for one copy. The cap of 12
-// keeps embed work bounded on very large images that would otherwise touch
-// every tile.
-func minRepetition(available, oneCopy int) int {
-	if oneCopy <= 0 {
-		return 1
+// selectTiles takes the top-scoring tiles in whole-frame-copy groups, capped at maxRepetition.
+func selectTiles(all []tiles.Tile, frameBits, bitsPerTile int) []int {
+	perCopy := (frameBits + bitsPerTile - 1) / bitsPerTile
+	idxs := tiles.SelectByScore(all, len(all))
+	copies := len(idxs) / perCopy
+	if copies < 1 {
+		return nil
 	}
-	r := available / oneCopy
-	if r < 1 {
-		return 1
+	if copies > maxRepetition {
+		copies = maxRepetition
 	}
-	if r > 12 {
-		return 12
-	}
-	return r
+	return idxs[:perCopy*copies]
 }
 
 func downgradeProfile(p StrengthProfile) StrengthProfile {
@@ -324,22 +324,13 @@ func downgradeProfile(p StrengthProfile) StrengthProfile {
 	return StrengthInvisible
 }
 
-func keyIDByte(id string) byte {
-	if id == "" {
-		return 0
+func keyIDBytes(id string) [ecc.KeyIDSize]byte {
+	var out [ecc.KeyIDSize]byte
+	if id != "" {
+		h := sha256.Sum256([]byte(id))
+		copy(out[:], h[:])
 	}
-	h := sha256.Sum256([]byte(id))
-	return h[0]
-}
-
-func hexDigest(d []byte) string {
-	const hex = "0123456789abcdef"
-	out := make([]byte, len(d)*2)
-	for i, b := range d {
-		out[i*2] = hex[b>>4]
-		out[i*2+1] = hex[b&0x0f]
-	}
-	return string(out)
+	return out
 }
 
 func toRGBA(src image.Image) *image.RGBA {
@@ -352,24 +343,29 @@ func toRGBA(src image.Image) *image.RGBA {
 	return dst
 }
 
-func splitYCbCrA(img *image.RGBA) (y *tiles.Plane, cb, cr, alpha []float64) {
+// splitYCbCr un-premultiplies semi-transparent pixels so colour math runs on straight RGB; mergeYCbCr re-premultiplies.
+func splitYCbCr(img *image.RGBA) (y *tiles.Plane, cb, cr []float64) {
 	w, h := img.Bounds().Dx(), img.Bounds().Dy()
-	yPx := make([]float64, w*h)
-	cb = make([]float64, w*h)
-	cr = make([]float64, w*h)
-	alpha = make([]float64, w*h)
+	n := w * h
+	yPx := make([]float64, n)
+	cb = make([]float64, n)
+	cr = make([]float64, n)
+	alpha := make([]float64, n)
 	for j := 0; j < h; j++ {
 		row := j * img.Stride
 		out := j * w
 		for i := 0; i < w; i++ {
-			r := float64(img.Pix[row+i*4])
-			g := float64(img.Pix[row+i*4+1])
-			b := float64(img.Pix[row+i*4+2])
-			a := float64(img.Pix[row+i*4+3])
-			yPx[out+i] = 0.299*r + 0.587*g + 0.114*b
-			cb[out+i] = -0.168736*r - 0.331264*g + 0.5*b + 128
-			cr[out+i] = 0.5*r - 0.418688*g - 0.081312*b + 128
-			alpha[out+i] = a / 255
+			px := img.Pix[row+i*4 : row+i*4+4]
+			r, g, b, a := float64(px[0]), float64(px[1]), float64(px[2]), float64(px[3])
+			if a > 0 && a < 255 {
+				s := 255 / a
+				r, g, b = r*s, g*s, b*s
+			}
+			idx := out + i
+			yPx[idx] = 0.299*r + 0.587*g + 0.114*b
+			cb[idx] = -0.168736*r - 0.331264*g + 0.5*b + 128
+			cr[idx] = 0.5*r - 0.418688*g - 0.081312*b + 128
+			alpha[idx] = a / 255
 		}
 	}
 	y = &tiles.Plane{W: w, H: h, Pixels: yPx, Alpha: alpha}
@@ -377,31 +373,36 @@ func splitYCbCrA(img *image.RGBA) (y *tiles.Plane, cb, cr, alpha []float64) {
 }
 
 func mergeYCbCr(img *image.RGBA, y *tiles.Plane, cb, cr []float64) {
-	w := y.W
 	for j := 0; j < y.H; j++ {
 		row := j * img.Stride
-		in := j * w
-		for i := 0; i < w; i++ {
-			yv := y.Pixels[in+i]
-			cbv := cb[in+i] - 128
-			crv := cr[in+i] - 128
+		in := j * y.W
+		for i := 0; i < y.W; i++ {
+			idx := in + i
+			if y.Alpha[idx] < transparentAlphaThreshold {
+				continue
+			}
+			yv, cbv, crv := y.Pixels[idx], cb[idx]-128, cr[idx]-128
 			r := yv + 1.402*crv
 			g := yv - 0.344136*cbv - 0.714136*crv
 			b := yv + 1.772*cbv
+			if a := img.Pix[row+i*4+3]; a < 255 {
+				s := float64(a) / 255
+				r, g, b = r*s, g*s, b*s
+			}
 			img.Pix[row+i*4+0] = clip255(r)
 			img.Pix[row+i*4+1] = clip255(g)
 			img.Pix[row+i*4+2] = clip255(b)
-			// alpha left untouched
 		}
 	}
 }
 
 func clip255(v float64) uint8 {
-	if v < 0 {
+	switch {
+	case v < 0:
 		return 0
-	}
-	if v > 255 {
+	case v > 255:
 		return 255
+	default:
+		return uint8(math.Round(v))
 	}
-	return uint8(math.Round(v))
 }

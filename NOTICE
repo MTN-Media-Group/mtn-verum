@@ -10,6 +10,9 @@ This program is distributed in the hope that it will be useful, but
 WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
 or FITNESS FOR A PARTICULAR PURPOSE.
 
+Current validation covers native-scale PNG embed/detect. JPEG round-trip,
+crop recovery, and resize recovery are not claimed for this version.
+
 Contact:
   License, copyright, and legal inquiries: legal@mtnmedia.group
   General inquiries:                       info@mtnmedia.group
