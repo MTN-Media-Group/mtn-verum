@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const PayloadVersion = 2
+const PayloadVersion = 1
 
 type Payload struct {
 	GeneratedAt  time.Time

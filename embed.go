@@ -249,7 +249,7 @@ func newPairRNG(key Key, tileIdx, subIdx int) *pairRNG {
 
 func (r *pairRNG) refill() {
 	mac := hmac.New(sha256.New, r.key.Secret)
-	mac.Write([]byte("verum-pairs-v2"))
+	mac.Write([]byte("verum-pairs-v1"))
 	kid := keyIDBytes(r.key.ID)
 	mac.Write(kid[:])
 	var seed [12]byte
