@@ -10,8 +10,21 @@ This program is distributed in the hope that it will be useful, but
 WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
 or FITNESS FOR A PARTICULAR PURPOSE.
 
-Current validation covers native-scale PNG embed/detect. JPEG round-trip,
-crop recovery, and resize recovery are not claimed for this version.
+Current validation covers PNG embed/detect at native scale; JPEG Q95
+round-trip with the Robust profile; Small top-left crop offsets up to 2 tile periods, when the original image dimensions are a multiple of the tile size and the cropped image retains at least 5 tiles per side;
+WebP decode; and lossless WebP encode.
+The current on-image PayloadVersion is 2 and uses an 8-byte SHA-256-truncated key ID inside a 60-byte Reed-Solomon frame.
+0.75x bilinear, 0.5x nearest-neighbor, and 2048→1024 bilinear large-image downscale detection with `StrengthRobust`.
+Downscale survival requires the resized image to keep both dimensions at least MinImageDim (256px), so the shortest side is the limiting dimension. Current measured coverage is 1024→512 for 0.5x nearest-neighbor, 1024→768 for 0.75x bilinear, 2048→1024 for 0.5x bilinear on the large-image path, and 384→288 for 0.75x bilinear at the boundary. The 1024→512 bilinear path is not claimed for PayloadVersion 2.
+
+Known limitations:
+Pure-flat images with no texture and no edges cannot carry the mark and
+return ErrNoCapacity; photos with very smooth regions such as extreme
+close-ups or gradient skies may have reduced robustness. JPEG below
+quality 95 is not supported in the current release; JPEG Q75/Q85 transcode survival is
+not claimed under the default Robust quality gates. Lossy WebP
+output is not supported; the project is pure-Go and has no CGO bindings
+to libwebp.
 
 Contact:
   License, copyright, and legal inquiries: legal@mtnmedia.group

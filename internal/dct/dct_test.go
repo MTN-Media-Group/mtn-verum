@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+
 // Copyright (C) 2026 MTN Media Group.
 
 package dct
@@ -47,6 +48,52 @@ func TestForwardLinear(t *testing.T) {
 	for i := range fsum {
 		if math.Abs(fsum[i]-(fa[i]+fb[i])) > 1e-9 {
 			t.Fatalf("non-linear at %d", i)
+		}
+	}
+}
+
+func TestAANMatchesReference(t *testing.T) {
+	src := [N * N]float64{}
+	for i := range src {
+		src[i] = math.Sin(float64(i)*0.31)*87 + math.Cos(float64(i)*0.17)*23
+	}
+	got := src
+	want := src
+	Forward(&got)
+	referenceForward(&want)
+	for i := range got {
+		if math.Abs(got[i]-want[i]) > 1e-9 {
+			t.Fatalf("idx %d: AAN %.12f reference %.12f diff %.12g", i, got[i], want[i], got[i]-want[i])
+		}
+	}
+}
+
+func referenceForward(b *[N * N]float64) {
+	var basis [N][N]float64
+	for k := 0; k < N; k++ {
+		scale := math.Sqrt(2.0 / N)
+		if k == 0 {
+			scale = 1.0 / math.Sqrt(N)
+		}
+		for n := 0; n < N; n++ {
+			basis[k][n] = scale * math.Cos(float64(2*n+1)*float64(k)*math.Pi/(2*N))
+		}
+	}
+	var tmp [N * N]float64
+	for r := 0; r < N; r++ {
+		for k := 0; k < N; k++ {
+			for n := 0; n < N; n++ {
+				tmp[r*N+k] += b[r*N+n] * basis[k][n]
+			}
+		}
+	}
+	for c := 0; c < N; c++ {
+		for k := 0; k < N; k++ {
+			var sum float64
+			for n := 0; n < N; n++ {
+				sum += tmp[n*N+c] * basis[k][n]
+			}
+			b[k*N+c] = sum
 		}
 	}
 }

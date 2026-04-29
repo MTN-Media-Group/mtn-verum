@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+
 // Copyright (C) 2026 MTN Media Group.
 
 // Package quality computes per-image distortion metrics.
@@ -30,9 +31,9 @@ func SSIM(a, b []float64, width, height int) float64 {
 	if len(a) != width*height || len(b) != width*height || width < 8 || height < 8 {
 		return 0
 	}
-	const win = 8
-	const c1 = (0.01 * 255) * (0.01 * 255)
-	const c2 = (0.03 * 255) * (0.03 * 255)
+	const win = 8                          // reason: 8x8 box window matches DCT sub-block alignment.
+	const c1 = (0.01 * 255) * (0.01 * 255) // reason: standard SSIM stability constant from Wang et al. 2004.
+	const c2 = (0.03 * 255) * (0.03 * 255) // reason: standard SSIM stability constant from Wang et al. 2004.
 	var sum float64
 	var n int
 	rows := height - win + 1
@@ -52,7 +53,7 @@ func SSIM(a, b []float64, width, height int) float64 {
 					sigAB += va * vb
 				}
 			}
-			const inv = 1.0 / (win * win)
+			const inv = 1.0 / (win * win) // reason: normalizes 8x8 SSIM window sums to per-pixel means.
 			muA *= inv
 			muB *= inv
 			sigA = sigA*inv - muA*muA

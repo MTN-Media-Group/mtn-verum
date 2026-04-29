@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+
 // Copyright (C) 2026 MTN Media Group.
 
 package verum
@@ -11,7 +12,7 @@ import (
 	"time"
 )
 
-const PayloadVersion = 1
+const PayloadVersion = 2 // reason: on-image frame version 2 widens key IDs to 8 bytes.
 
 type Payload struct {
 	GeneratedAt  time.Time

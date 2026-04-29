@@ -78,4 +78,7 @@ Signed-off-by line will not be merged.
 
 ## Code Style and Tests
 
-(To be expanded in a follow-up commit alongside the initial implementation.)
+- Code style: keep `gofmt` and `go vet` clean; avoid multi-line `//` comments; avoid marketing language; add tests for any new feature.
+- Tests: prefer integration-style tests through the public API; use unit tests where they exercise specific algorithms such as DCT, RS, or ECC.
+- Reviews: run `go vet`, `go test`, and `go test -race -short` before requesting review.
+- Sign your commits.

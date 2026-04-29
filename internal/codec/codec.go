@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+
 // Copyright (C) 2026 MTN Media Group.
 
 // Package codec wraps PNG, JPEG, and lossless WebP I/O.
@@ -24,7 +25,12 @@ const (
 	FormatUnknown Format = ""
 )
 
+const DefaultJPEGQuality = 95   // reason: matches v1 quality calibration; embed enforces this floor for JPEG outputs.
+const maxImageDim = 4096        // reason: 4K is the practical upper bound for v1; matches the 4096 resampling cap.
+const maxImagePixels = 16 << 20 // reason: covers 4K with headroom; bounds each float64 plane near 128MB and full pipeline near 768MB.
+
 var ErrUnsupported = errors.New("codec: unsupported format")
+var ErrImageTooLarge = errors.New("codec: image too large")
 
 func Sniff(data []byte) Format {
 	switch {
@@ -41,6 +47,12 @@ func Sniff(data []byte) Format {
 // Decode picks the decoder from the bytes, not a caller-supplied MIME type.
 func Decode(data []byte) (image.Image, Format, error) {
 	f := Sniff(data)
+	if f == FormatUnknown {
+		return nil, FormatUnknown, ErrUnsupported
+	}
+	if err := rejectOversizedImage(data, f); err != nil {
+		return nil, f, err
+	}
 	r := bytes.NewReader(data)
 	switch f {
 	case FormatPNG:
@@ -56,8 +68,31 @@ func Decode(data []byte) (image.Image, Format, error) {
 	return nil, FormatUnknown, ErrUnsupported
 }
 
+func rejectOversizedImage(data []byte, f Format) error {
+	var cfg image.Config
+	var err error
+	r := bytes.NewReader(data)
+	switch f {
+	case FormatPNG:
+		cfg, err = png.DecodeConfig(r)
+	case FormatJPEG:
+		cfg, err = jpeg.DecodeConfig(r)
+	case FormatWebP:
+		cfg, err = xwebp.DecodeConfig(r)
+	default:
+		return ErrUnsupported
+	}
+	if err != nil {
+		return err
+	}
+	if cfg.Width > maxImageDim || cfg.Height > maxImageDim || cfg.Width*cfg.Height > maxImagePixels {
+		return ErrImageTooLarge
+	}
+	return nil
+}
+
 type EncodeOptions struct {
-	JPEGQuality int  // 1..100; 0 means default (85)
+	JPEGQuality int // 1..100; 0 means DefaultJPEGQuality.
 	PNGFastest  bool
 }
 
@@ -77,7 +112,7 @@ func Encode(img image.Image, format Format, opt EncodeOptions) ([]byte, error) {
 	case FormatJPEG:
 		q := opt.JPEGQuality
 		if q == 0 {
-			q = 85
+			q = DefaultJPEGQuality
 		}
 		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: q}); err != nil {
 			return nil, err
