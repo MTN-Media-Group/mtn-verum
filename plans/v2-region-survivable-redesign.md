@@ -1,3 +1,6 @@
+> **Superseded by [v2.1-region-survivable-redesign.md](v2.1-region-survivable-redesign.md)** (2026-08-14): the dense tiled carrier,
+> translation-variant payload, capacity table, and security claims did not survive review.
+
 # Plan: `mtn-verum` v1 format - region-survivable, rotation-invariant, key-secure watermarking
 
 ## Context
